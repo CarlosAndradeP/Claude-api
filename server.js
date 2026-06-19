@@ -35,11 +35,12 @@ function saveKeys() {
 adminApp.use(express.json());
 adminApp.use(express.static(path.join(__dirname, 'public')));
 
-let proxyConfig = { disableAbort: false };
+let proxyConfig = { disableAbort: false, transparentMode: false };
 
 adminApp.get('/api/config', (req, res) => res.json(proxyConfig));
 adminApp.post('/api/config', (req, res) => {
-    proxyConfig.disableAbort = !!req.body.disableAbort;
+    if (req.body.disableAbort !== undefined) proxyConfig.disableAbort = !!req.body.disableAbort;
+    if (req.body.transparentMode !== undefined) proxyConfig.transparentMode = !!req.body.transparentMode;
     res.json(proxyConfig);
 });
 
@@ -155,51 +156,61 @@ proxyApp.all('/v1/*', async (req, res) => {
                 }
             };
 
-            let finalBodyBuffer = null;
-
             if (req.method !== 'GET' && req.method !== 'HEAD' && req.body) {
-                let finalBodyStr = "";
-                
-                // Intercepta e corrige os parâmetros para o modelo glm-5.1
-                if (Buffer.isBuffer(req.body) && req.body.length > 0) {
-                    try {
-                        const jsonBody = JSON.parse(req.body.toString('utf8'));
-                        
-                        // Força os limites e parâmetros exigidos pela documentação da NVIDIA NIM
-                        if (jsonBody.model && jsonBody.model.includes('glm-5.1')) {
-                            if (jsonBody.max_tokens > 16384) {
-                                jsonBody.max_tokens = 16384;
-                            }
-                            // Adiciona os parâmetros recomendados se não existirem
-                            if (jsonBody.temperature === undefined) jsonBody.temperature = 1;
-                            if (jsonBody.top_p === undefined) jsonBody.top_p = 1;
-                        }
-                        finalBodyStr = JSON.stringify(jsonBody);
-                    } catch (e) {
-                        finalBodyStr = req.body.toString('utf8');
+                if (proxyConfig.transparentMode) {
+                    // TRANSPARENT MODE: No JSON parsing, no modifications, no Fast-Track.
+                    // Just raw pass-through of the exact bytes received.
+                    fetchOptions.body = req.body;
+                    if (Buffer.isBuffer(req.body)) {
+                        fetchOptions.headers['Content-Length'] = req.body.length.toString();
                     }
-                } else if (!Buffer.isBuffer(req.body) && Object.keys(req.body).length > 0) {
-                    finalBodyStr = JSON.stringify(req.body);
-                }
-                
-                if (finalBodyStr) {
-                    finalBodyBuffer = Buffer.from(finalBodyStr, 'utf8');
-                    fetchOptions.body = finalBodyBuffer;
-                    fetchOptions.headers['Content-Length'] = finalBodyBuffer.length.toString();
+                    console.log(`[Proxy 🔍] Modo Transparente Ativo: Payload repassado sem modificações.`);
+                } else {
+                    let finalBodyStr = "";
+                    let finalBodyBuffer = null;
                     
-                    // FAST-TRACK: Prevents OpenCode from timing out waiting for NVIDIA
-                    if (finalBodyStr.includes('"stream":true') || finalBodyStr.includes('"stream": true')) {
-                        if (!res.headersSent) {
-                            res.writeHead(200, {
-                                'Content-Type': 'text/event-stream; charset=utf-8',
-                                'Cache-Control': 'no-cache',
-                                'Connection': 'keep-alive',
-                                'Transfer-Encoding': 'chunked',
-                                'Access-Control-Allow-Origin': '*',
-                                'Access-Control-Allow-Headers': '*'
-                            });
-                            res.write(':\\n\\n'); // Envia um heartbeat vazio em formato SSE para iniciar o stream sem quebrar o cliente
-                            console.log(`[Proxy ⚡] Fast-Track: Headers 200 OK enviados imediatamente para evitar timeout do OpenCode!`);
+                    // Intercepta e corrige os parâmetros para o modelo glm-5.1
+                    if (Buffer.isBuffer(req.body) && req.body.length > 0) {
+                        try {
+                            const jsonBody = JSON.parse(req.body.toString('utf8'));
+                            
+                            // Força os limites e parâmetros exigidos pela documentação da NVIDIA NIM
+                            if (jsonBody.model && jsonBody.model.includes('glm-5.1')) {
+                                if (jsonBody.max_tokens > 16384) {
+                                    jsonBody.max_tokens = 16384;
+                                }
+                                // Adiciona os parâmetros recomendados se não existirem
+                                if (jsonBody.temperature === undefined) jsonBody.temperature = 1;
+                                if (jsonBody.top_p === undefined) jsonBody.top_p = 1;
+                            }
+                            finalBodyStr = JSON.stringify(jsonBody);
+                        } catch (e) {
+                            finalBodyStr = req.body.toString('utf8');
+                        }
+                    } else if (!Buffer.isBuffer(req.body) && Object.keys(req.body).length > 0) {
+                        finalBodyStr = JSON.stringify(req.body);
+                    }
+                    
+                    if (finalBodyStr) {
+                        finalBodyBuffer = Buffer.from(finalBodyStr, 'utf8');
+                        fetchOptions.body = finalBodyBuffer;
+                        fetchOptions.headers['Content-Length'] = finalBodyBuffer.length.toString();
+                        
+                        // FAST-TRACK: Prevents OpenCode from timing out waiting for NVIDIA
+                        if (finalBodyStr.includes('"stream":true') || finalBodyStr.includes('"stream": true')) {
+                            if (!res.headersSent) {
+                                res.writeHead(200, {
+                                    'Content-Type': 'text/event-stream; charset=utf-8',
+                                    'Cache-Control': 'no-cache',
+                                    'Connection': 'keep-alive',
+                                    'Transfer-Encoding': 'chunked',
+                                    'X-Accel-Buffering': 'no',
+                                    'Access-Control-Allow-Origin': '*',
+                                    'Access-Control-Allow-Headers': '*'
+                                });
+                                res.write(':\\n\\n'); // Envia um heartbeat vazio em formato SSE para iniciar o stream sem quebrar o cliente
+                                console.log(`[Proxy ⚡] Fast-Track: Headers 200 OK enviados imediatamente para evitar timeout do OpenCode!`);
+                            }
                         }
                     }
                 }
@@ -251,17 +262,25 @@ proxyApp.all('/v1/*', async (req, res) => {
             }
 
             if (fetchRes.body) {
-                console.log(`[Proxy 🌊] Iniciando streaming do corpo da resposta para o cliente...`);
-                const stream = Readable.fromWeb(fetchRes.body);
-                stream.pipe(res);
-                stream.on('error', (err) => {
-                    console.error(`[Proxy ❌] Erro no stream com a chave '${keyObj.name}':`, err.message);
-                    if (!res.headersSent) res.status(500).end();
-                    else res.end();
-                });
-                stream.on('end', () => {
-                    console.log(`[Proxy ✨] Streaming finalizado com sucesso!`);
-                });
+                console.log(`[Proxy 🌊] Iniciando streaming de altíssima eficiência (Zero-Buffer) para o cliente...`);
+                const reader = fetchRes.body.getReader();
+                
+                const pump = async () => {
+                    try {
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+                            res.write(value);
+                        }
+                        console.log(`[Proxy ✨] Streaming finalizado com sucesso!`);
+                    } catch (err) {
+                        console.error(`[Proxy ❌] Erro no stream com a chave '${keyObj.name}':`, err.message);
+                        if (!res.headersSent) res.status(500);
+                    } finally {
+                        res.end();
+                    }
+                };
+                pump();
                 return;
             } else {
                 console.log(`[Proxy ✨] Resposta sem body. Finalizando req.`);

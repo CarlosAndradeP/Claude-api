@@ -30,6 +30,11 @@
 
             <div class="flex gap-4">
                 <div class="text-sm bg-gray-800 px-3 py-1 flex items-center gap-2 rounded border border-gray-600">
+                    <span>Modo Transparente:</span>
+                    <input type="checkbox" id="toggleTransparent" class="w-4 h-4 text-purple-500 rounded focus:ring-purple-500 focus:ring-2 cursor-pointer bg-gray-700 border-gray-600">
+                </div>
+
+                <div class="text-sm bg-gray-800 px-3 py-1 flex items-center gap-2 rounded border border-gray-600">
                     <span>Desativar Abort:</span>
                     <input type="checkbox" id="toggleAbort" class="w-4 h-4 text-green-500 rounded focus:ring-green-500 focus:ring-2 cursor-pointer bg-gray-700 border-gray-600">
                 </div>
@@ -275,11 +280,13 @@
 
         // Config Init
         const toggleAbort = document.getElementById('toggleAbort');
+        const toggleTransparent = document.getElementById('toggleTransparent');
         
         async function fetchConfig() {
             const res = await fetch('/api/config');
             const conf = await res.json();
             toggleAbort.checked = conf.disableAbort;
+            toggleTransparent.checked = conf.transparentMode;
         }
         
         toggleAbort.addEventListener('change', async (e) => {
@@ -288,6 +295,17 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ disableAbort: e.target.checked })
             });
+        });
+
+        toggleTransparent.addEventListener('change', async (e) => {
+            await fetch('/api/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ transparentMode: e.target.checked })
+            });
+            if (e.target.checked) {
+                alert("AVISO: O Modo Transparente desliga TODAS as modificações do Proxy, incluindo correção de Tokens e Fast-Track Headers. O OpenCode voltará a se comunicar com a NVIDIA exatamente como no original. Isso serve para testar de quem é o erro (NVIDIA ou Proxy).");
+            }
         });
 
         fetchConfig();
