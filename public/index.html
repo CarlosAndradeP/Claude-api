@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+
+<html lang="pt-BR">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Gerenciador NIM Proxy</title>
+
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+
+</head>
+
+<body class="bg-gray-900 text-white font-sans antialiased">
+
+    <div class="max-w-4xl mx-auto p-6 mt-10">
+
+        <div class="flex items-center justify-between border-b border-gray-700 pb-4 mb-6">
+
+            <h1 class="text-3xl font-bold text-green-400">
+
+                <i class="fa-solid fa-server mr-2"></i> NIM Local Proxy
+
+            </h1>
+
+            <div class="flex gap-4">
+                <div class="text-sm bg-gray-800 px-3 py-1 flex items-center gap-2 rounded border border-gray-600">
+                    <span>Desativar Abort:</span>
+                    <input type="checkbox" id="toggleAbort" class="w-4 h-4 text-green-500 rounded focus:ring-green-500 focus:ring-2 cursor-pointer bg-gray-700 border-gray-600">
+                </div>
+
+                <div class="text-sm bg-gray-800 px-3 py-1 rounded-full border border-gray-600 flex items-center">
+
+                    Porta: <span class="font-mono text-blue-400 font-bold ml-1">11431</span>
+
+                </div>
+            </div>
+
+        </div>
+
+
+
+        <!-- Formulário para adicionar Chave -->
+
+        <div class="bg-gray-800 p-6 rounded-lg shadow-lg mb-8 border border-gray-700">
+
+            <h2 class="text-xl font-semibold mb-4 text-gray-200">Adicionar Nova Key</h2>
+
+            <form id="keyForm" class="flex flex-col gap-4">
+
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+
+                    <div>
+
+                        <label class="block text-sm font-medium text-gray-400 mb-1">Nome/Identificador</label>
+
+                        <input type="text" id="name" placeholder="Ex: Chave 1 - Desafio" required class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-green-500">
+
+                    </div>
+
+                    <div>
+
+                        <label class="block text-sm font-medium text-gray-400 mb-1">Papel na Arquitetura</label>
+
+                        <select id="role" class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-green-500">
+
+                            <option value="main">Agente Principal (Prioridade 1)</option>
+
+                            <option value="sub">Sub-Agente (Round-Robin)</option>
+
+                            <option value="all">Balanceamento Geral / Qualquer</option>
+
+                        </select>
+
+                    </div>
+
+                    <div class="md:col-span-3">
+
+                        <label class="block text-sm font-medium text-gray-400 mb-1">API Key (nvapi-...)</label>
+
+                        <input type="text" id="key" placeholder="nvapi-..." required class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white font-mono text-sm focus:outline-none focus:border-green-500">
+
+                    </div>
+
+                </div>
+
+                <button type="submit" class="self-end bg-green-600 hover:bg-green-500 text-white font-semibold py-2 px-6 rounded transition duration-200">
+
+                    <i class="fa-solid fa-plus mr-1"></i> Salvar Key
+
+                </button>
+
+            </form>
+
+        </div>
+
+
+
+        <!-- Lista de chaves -->
+
+        <div class="bg-gray-800 p-6 rounded-lg shadow-lg border border-gray-700">
+
+            <h2 class="text-xl font-semibold mb-4 text-gray-200">Keys Ativas no Pool</h2>
+
+            <div class="overflow-x-auto">
+
+                <table class="w-full text-left border-collapse">
+
+                    <thead>
+
+                        <tr class="bg-gray-700 text-gray-300 text-sm">
+
+                            <th class="p-3 rounded-tl-lg">Nome</th>
+
+                            <th class="p-3">Papel (Role)</th>
+
+                            <th class="p-3">Key Parcial</th>
+
+                            <th class="p-3 rounded-tr-lg text-right">Ação</th>
+
+                        </tr>
+
+                    </thead>
+
+                    <tbody id="keysTableBody">
+
+                        <!-- Conteúdo populado por JS -->
+
+                    </tbody>
+
+                </table>
+
+            </div>
+
+        </div>
+
+    </div>
+
+
+
+    <script>
+
+        const API_URL = '/api/keys';
+
+
+
+        async function fetchKeys() {
+
+            const res = await fetch(API_URL);
+
+            const keys = await res.json();
+
+            const tbody = document.getElementById('keysTableBody');
+
+            tbody.innerHTML = '';
+
+
+
+            if(keys.length === 0) {
+
+                tbody.innerHTML = `<tr><td colspan="4" class="p-4 text-center text-gray-500">Nenhuma key cadastrada. O Proxy não irá funcionar.</td></tr>`;
+
+                return;
+
+            }
+
+
+
+            keys.forEach(k => {
+
+                const tr = document.createElement('tr');
+
+                tr.className = "border-b border-gray-700 hover:bg-gray-750";
+
+                
+
+                const roleBadge = k.role === 'main' ? '<span class="bg-blue-900 text-blue-300 px-2 py-1 rounded text-xs font-bold">Principal</span>' : 
+
+                                  k.role === 'sub' ? '<span class="bg-purple-900 text-purple-300 px-2 py-1 rounded text-xs font-bold">Sub-Agente</span>' : 
+
+                                  '<span class="bg-gray-600 text-gray-300 px-2 py-1 rounded text-xs font-bold">Geral</span>';
+
+
+
+                const maskedKey = k.key.substring(0, 10) + '...' + k.key.substring(k.key.length - 4);
+
+
+
+                tr.innerHTML = `
+
+                    <td class="p-3 font-medium">${k.name}</td>
+
+                    <td class="p-3">${roleBadge}</td>
+
+                    <td class="p-3 font-mono text-sm text-gray-400">${maskedKey}</td>
+
+                    <td class="p-3 text-right">
+
+                        <button onclick="deleteKey('${k.id}')" class="text-red-400 hover:text-red-300 transition">
+
+                            <i class="fa-solid fa-trash"></i>
+
+                        </button>
+
+                    </td>
+
+                `;
+
+                tbody.appendChild(tr);
+
+            });
+
+        }
+
+
+
+        document.getElementById('keyForm').addEventListener('submit', async (e) => {
+
+            e.preventDefault();
+
+            const payload = {
+
+                name: document.getElementById('name').value,
+
+                role: document.getElementById('role').value,
+
+                key: document.getElementById('key').value
+
+            };
+
+
+
+            await fetch(API_URL, {
+
+                method: 'POST',
+
+                headers: { 'Content-Type': 'application/json' },
+
+                body: JSON.stringify(payload)
+
+            });
+
+
+
+            document.getElementById('keyForm').reset();
+
+            fetchKeys();
+
+        });
+
+
+
+        async function deleteKey(id) {
+
+            if(confirm('Tem certeza que deseja remover esta chave do pool?')) {
+
+                await fetch(`${API_URL}/${id}`, { method: 'DELETE' });
+
+                fetchKeys();
+
+            }
+
+        }
+
+
+
+        // Init
+
+        fetchKeys();
+
+        // Config Init
+        const toggleAbort = document.getElementById('toggleAbort');
+        
+        async function fetchConfig() {
+            const res = await fetch('/api/config');
+            const conf = await res.json();
+            toggleAbort.checked = conf.disableAbort;
+        }
+        
+        toggleAbort.addEventListener('change', async (e) => {
+            await fetch('/api/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ disableAbort: e.target.checked })
+            });
+        });
+
+        fetchConfig();
+
+    </script>
+
+</body>
+
+</html>
+

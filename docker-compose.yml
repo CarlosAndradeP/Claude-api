@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  nvidia-nim-proxy:
+    build: .
+    container_name: nim_proxy_balancer
+    ports:
+      # Painel Admin
+      - "88:88"
+      # API Proxy
+      - "11431:11431"
+    volumes:
+      # Cria um volume local ./data mapeado para /app/data
+      # Isso garante que suas Keys não se percam caso o container reinicie
+      - ./data:/app/data
+    restart: unless-stopped

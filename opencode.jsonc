@@ -1,0 +1,28 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "nim-proxy/z-ai/glm-5.1",
+  "provider": {
+    "nim-proxy": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "NIM Local Proxy",
+      "options": {
+        "baseURL": "http://192.168.3.5:11431/v1"
+      },
+      "models": {
+        "z-ai/glm-5.1": {
+          "name": "Z.AI GLM 5.1"
+        }
+      }
+    }
+  },
+  "mcp": {
+    "context7": {
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp",
+      "enabled": true,
+      "headers": {
+        "CONTEXT7_API_KEY": "ctx7sk-07368bf0-366a-46b7-948f-1f9f20795edc"
+      }
+    }
+  }
+}
