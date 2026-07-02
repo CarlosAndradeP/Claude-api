@@ -35,7 +35,7 @@ function saveKeys() {
 adminApp.use(express.json());
 adminApp.use(express.static(path.join(__dirname, 'public')));
 
-let proxyConfig = { disableAbort: false, transparentMode: false };
+let proxyConfig = { disableAbort: false, transparentMode: true };
 
 adminApp.get('/api/config', (req, res) => res.json(proxyConfig));
 adminApp.post('/api/config', (req, res) => {
@@ -80,6 +80,17 @@ proxyApp.use(express.raw({ type: '*/*', limit: '50mb' })); // Permite ler qualqu
 
 let subKeyIndex = 0;
 let allKeyIndex = 0;
+
+const COOLDOWN_MS = 65 * 1000;
+const keyCooldowns = new Map(); // keyId -> timestamp (ms) de liberação após HTTP 429
+
+function isKeyInCooldown(keyObj) {
+    const expiry = keyCooldowns.get(keyObj.id);
+    if (!expiry) return false;
+    if (Date.now() < expiry) return true;
+    keyCooldowns.delete(keyObj.id); // libera e evita crescimento indefinido do Map
+    return false;
+}
 
 proxyApp.all('/v1/*', async (req, res) => {
     const agentType = (req.headers['x-agent-type'] || 'none').toLowerCase();
@@ -127,6 +138,19 @@ proxyApp.all('/v1/*', async (req, res) => {
     }
 
     pipeline = [...new Map(pipeline.map(item => [item.key, item])).values()];
+
+    const antesDoCooldown = pipeline.length;
+    pipeline = pipeline.filter(k => !isKeyInCooldown(k));
+    const puladas = antesDoCooldown - pipeline.length;
+    if (puladas > 0) {
+        console.log(`[Proxy ⏳] ${puladas} chave(s) em cooldown (429) puladas nesta requisição.`);
+    }
+
+    if (pipeline.length === 0) {
+        console.error(`[Proxy 🛑] Todas as chaves estão em cooldown (rate limit 429).`);
+        return res.status(429).json({ error: "Todas as chaves disponíveis estão em cooldown após rate limit (429). Aguarde alguns segundos e tente novamente." });
+    }
+
     const targetUrl = `https://integrate.api.nvidia.com${req.url}`;
 
     for (const keyObj of pipeline) {
@@ -228,8 +252,9 @@ proxyApp.all('/v1/*', async (req, res) => {
             console.log(`[Proxy ✅] Resposta da NVIDIA recebida em ${duration}ms! Status: ${fetchRes.status}`);
 
             if (fetchRes.status === 429) {
-                console.warn(`[Proxy ⚠️] Rate limit na chave '${keyObj.name}'. Realizando fallback...`);
-                continue; 
+                keyCooldowns.set(keyObj.id, Date.now() + COOLDOWN_MS);
+                console.warn(`[Proxy ⚠️] Rate limit (429) na chave '${keyObj.name}'. Colocada em cooldown por ${COOLDOWN_MS / 1000}s. Realizando fallback para a próxima chave...`);
+                continue;
             }
 
             if (fetchRes.status !== 200) {

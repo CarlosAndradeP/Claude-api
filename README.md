@@ -5,7 +5,7 @@ Proxy local para balanceamento de chaves de API do NVIDIA NIM, projetado para co
 ## Funcionalidades
 
 - **Balanceamento de chaves**: Distribui requisições entre um pool de chaves NVIDIA NIM com roteamento baseado no tipo de agente
-- **Fallback automático**: Ao receber HTTP 429 (rate limit), tenta automaticamente a próxima chave disponível no pipeline
+- **Fallback automático com cooldown**: Ao receber HTTP 429 (rate limit), tenta a próxima chave disponível no pipeline e coloca a chave falha em cooldown por 65 segundos, impedindo que ela seja reutilizada até o limite da NVIDIA resetar
 - **Streaming SSE com Fast-Track**: Para requisições com `stream: true`, envia headers `200 OK` e heartbeat imediatamente, evitando timeout do cliente enquanto aguarda a resposta da NVIDIA
 - **Zero-buffer streaming**: Replica os chunks do upstream diretamente para o cliente em tempo real
 - **Modo Transparente**: Desabilita todas as modificações de body e headers Fast-Track, encaminhando a requisição exatamente como recebida (útil para debug)
@@ -124,9 +124,9 @@ Exemplo de configuração no `opencode.jsonc`:
 | Configuração | Tipo | Padrão | Descrição |
 |---|---|---|---|
 | `disableAbort` | boolean | `false` | Quando `true`, não cancela requisições upstream ao desconectar o cliente |
-| `transparentMode` | boolean | `false` | Quando `true`, desabilita modificações de body e headers Fast-Track |
+| `transparentMode` | boolean | `true` | Quando `true`, desabilita modificações de body e headers Fast-Track (ativo por padrão) |
 
-> **Nota**: Estas configurações são mantidas apenas em memória e são redefinidas ao reiniciar o servidor.
+> **Nota**: Estas configurações são mantidas apenas em memória. O `transparentMode` reinicia sempre ativado (`true`); o `disableAbort` reinicia como `false`. O cooldown de 65s das chaves após 429 também é em memória e zera a cada reinício (esperado — o limite já terá resetado).
 
 ## Estrutura do Projeto
 
