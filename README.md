@@ -1,175 +1,111 @@
 # NIM Proxy Load Balancer
 
-Proxy local para balanceamento de chaves de API do NVIDIA NIM, projetado para contornar o limite de 40 RPM (requisições por minuto) por chave através de roteamento inteligente e fallback automático entre múltiplas chaves.
+Proxy local para múltiplas chaves da API NVIDIA NIM, com balanceamento consciente de capacidade, fallback limitado, streaming e painel de saúde/uso.
 
-## Funcionalidades
+## O que mudou no balanceamento
 
-- **Balanceamento de chaves**: Distribui requisições entre um pool de chaves NVIDIA NIM com roteamento baseado no tipo de agente
-- **Fallback automático com cooldown**: Ao receber HTTP 429 (rate limit), tenta a próxima chave disponível no pipeline e coloca a chave falha em cooldown por 65 segundos, impedindo que ela seja reutilizada até o limite da NVIDIA resetar
-- **Streaming SSE com Fast-Track**: Para requisições com `stream: true`, envia headers `200 OK` e heartbeat imediatamente, evitando timeout do cliente enquanto aguarda a resposta da NVIDIA
-- **Zero-buffer streaming**: Replica os chunks do upstream diretamente para o cliente em tempo real
-- **Modo Transparente**: Desabilita todas as modificações de body e headers Fast-Track, encaminhando a requisição exatamente como recebida (útil para debug)
-- **Controle de Abort**: Configura se requisições upstream devem ser canceladas quando o cliente desconecta
-- **Patch automático para GLM-5.1**: Limita `max_tokens` a 16384 e adiciona `temperature` e `top_p` padrão quando ausentes
-- **Painel Admin Web**: Interface para gerenciamento de chaves em tempo real sem reiniciar o serviço
-- **Suporte CORS**: Headers permissivos para acesso de qualquer origem
+O proxy não faz mais um round-robin cego nem tenta o pool inteiro em toda falha. Cada chave possui estado próprio:
 
-## Arquitetura
+- **Token bucket**: padrão de 38 RPM por chave, abaixo do limite nominal de 40 RPM.
+- **Burst limitado**: no máximo 3 chamadas imediatas por chave.
+- **Concorrência limitada**: no máximo 2 chamadas em voo por chave.
+- **Menor carga primeiro**: dentro do papel preferido, escolhe a chave com menos chamadas em voo, mais tokens e uso menos recente.
+- **Máximo de tentativas**: uma chamada tenta no máximo 3 chaves, evitando amplificação de carga.
+- **Cooldown adaptativo**: `429` respeita `Retry-After`; sem esse header, começa em 65 segundos e cresce em falhas consecutivas.
+- **Circuit breaker**: `401`/`403` isolam a chave por 15 minutos; falhas de rede e `5xx` usam backoff exponencial curto.
+- **Backpressure no stream**: o proxy espera o cliente consumir cada chunk, em vez de acumular dados em memória.
 
-```
-Cliente (OpenCode / LangChain / AutoGen)
-        │
-        ▼
-┌─────────────────────────────────┐
-│  Proxy Server (porta 11431)     │
-│  - Intercepta /v1/*            │
-│  - Injeta chave de API          │
-│  - Roteamento por x-agent-type │
-│  - Fallback em HTTP 429        │
-│  - Streaming SSE                │
-└──────────┬──────────────────────┘
-           │
-           ▼
-  NVIDIA NIM API (integrate.api.nvidia.com)
+O header `x-agent-type` mantém a afinidade:
 
-┌─────────────────────────────────┐
-│  Admin Server (porta 88)        │
-│  - Painel Web de gestão         │
-│  - API REST para chaves         │
-│  - Configuração do proxy        │
-└─────────────────────────────────┘
-```
+| Valor | Preferência | Fallback |
+|---|---|---|
+| `main` | `main` e `all` | `sub` |
+| `sub` | `sub` e `all` | `main` |
+| ausente | qualquer chave | — |
 
-## Roteamento de Chaves (Pipeline)
+## Estatísticas e saúde
 
-O proxy roteia as requisições com base no header HTTP customizado `x-agent-type`:
+O painel em `http://localhost:88` mostra, por chave:
 
-| Header `x-agent-type` | Comportamento |
-|---|---|
-| `main` | Tenta chaves "Principal" primeiro, fallback para "Sub" e "Geral" |
-| `sub` | Round-robin entre chaves "Sub", fallback para "Principal" e "Geral" |
-| Ausente / `none` | Round-robin entre todas as chaves disponíveis |
+- tentativas, sucessos, falhas e ocorrências de rate limit;
+- taxa de sucesso, latência média e bytes de entrada/saída;
+- chamadas atualmente em voo e capacidade estimada pelo token bucket;
+- data do último uso, sucesso e erro;
+- estado `Saudável`, `Falhando`, `Cooldown`, `Inativa` ou `Não testada`.
 
-Chaves duplicadas são removidas automaticamente antes de tentar o pipeline. Se todas as chaves forem exauridas, retorna HTTP 429 ao cliente.
+Toda chamada real atualiza a saúde passivamente. O botão de coração executa um check ativo individual em `GET /v1/models`. Checks usam o mesmo limite local, não rodam simultaneamente para a mesma chave e podem reabilitar uma chave isolada.
 
-## Instalação e Execução
+As estatísticas ficam em `data/keys.json` e são gravadas de forma atômica e agrupada. A API administrativa nunca devolve o segredo completo; apenas a chave mascarada.
 
-### Docker (recomendado)
+## Execução
 
-```bash
-docker-compose up -d --build
-```
-
-### Node.js (desenvolvimento local)
-
-Requer **Node.js 20+** (necessário para `fetch` nativo e Web Streams API).
+Requer Node.js 20 ou superior.
 
 ```bash
 npm install
+npm test
 npm start
 ```
 
-## Configuração Pós-Instalação
+Com Docker:
 
-1. Acesse `http://localhost:88` no navegador
-2. Adicione suas chaves NVIDIA API (formato `nvapi-...`), atribuindo um papel:
-   - **Principal** (`main`): Chave primária, usada primeiro pelo tipo `main`
-   - **Sub-Agente** (`sub`): Chave secundária, usada em rodízio pelo tipo `sub`
-   - **Geral** (`general`): Disponível como fallback para qualquer tipo
-3. Configure seu cliente de IA para usar `http://localhost:11431/v1` como base URL
-
-## Integração com OpenCode
-
-Exemplo de configuração no `opencode.jsonc`:
-
-```jsonc
-{
-  "model": "nim-proxy/z-ai/glm-5.1",
-  "provider": {
-    "nim-proxy": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "NIM Local Proxy",
-      "options": {
-        "baseURL": "http://localhost:11431/v1"
-      },
-      "models": {
-        "z-ai/glm-5.1": {
-          "name": "Z.AI GLM 5.1"
-        }
-      }
-    }
-  }
-}
+```bash
+docker compose up -d --build
 ```
 
-## API REST (Admin - Porta 88)
+Por padrão, o Compose publica as duas portas apenas em `127.0.0.1`, impedindo acesso acidental pela rede local. O diretório `data` não entra na imagem Docker.
+
+Depois:
+
+1. Acesse `http://localhost:88` e cadastre as chaves.
+2. Configure o cliente com a base URL `http://localhost:11431/v1`.
+3. Opcionalmente envie `x-agent-type: main` ou `x-agent-type: sub`.
+
+## Configuração
+
+Os limites podem ser alterados no painel. Variáveis de ambiente definem os valores iniciais:
+
+| Variável | Padrão | Descrição |
+|---|---:|---|
+| `REQUESTS_PER_MINUTE` | `38` | Limite local por chave |
+| `KEY_BURST` | `3` | Capacidade imediata por chave |
+| `MAX_CONCURRENT_PER_KEY` | `2` | Chamadas simultâneas por chave |
+| `MAX_ATTEMPTS` | `3` | Máximo de chaves tentadas por requisição |
+| `UPSTREAM_TIMEOUT_MS` | `120000` | Timeout até o upstream responder com headers |
+| `UPSTREAM_ORIGIN` | NVIDIA NIM | Origem alternativa, útil para testes |
+| `ADMIN_PORT` | `88` | Porta do painel |
+| `PROXY_PORT` | `11431` | Porta do proxy |
+| `PROXY_CORS_ORIGIN` | vazio | Habilita CORS somente para a origem informada |
+
+Não habilite CORS com `*` em uma instalação local: uma página maliciosa aberta no navegador poderia gerar chamadas contra o proxy e consumir as cotas.
+
+As opções existentes continuam disponíveis:
+
+- `transparentMode`: encaminha o body sem alterações. Desativado, aplica o ajuste de parâmetros do GLM-5.1.
+- `disableAbort`: mantém a chamada upstream mesmo quando o cliente desconecta.
+
+O antigo “Fast-Track” foi removido. Enviar `200 OK` antes da resposta do upstream mascarava erros e tornava impossível fazer fallback HTTP corretamente. O streaming continua sendo repassado chunk a chunk assim que a NVIDIA aceita a requisição.
+
+## API administrativa
 
 | Método | Endpoint | Descrição |
 |---|---|---|
-| `GET` | `/` | Painel admin web |
-| `GET` | `/api/keys` | Retorna todas as chaves cadastradas |
-| `POST` | `/api/keys` | Adiciona nova chave. Body: `{key, role, name}` |
-| `DELETE` | `/api/keys/:id` | Remove uma chave pelo ID |
-| `GET` | `/api/config` | Retorna configuração do proxy |
-| `POST` | `/api/config` | Atualiza configuração. Body: `{disableAbort?, transparentMode?}` |
+| `GET` | `/api/keys` | Chaves mascaradas, estatísticas e saúde |
+| `POST` | `/api/keys` | Adiciona `{ name, key, role }` |
+| `DELETE` | `/api/keys/:id` | Exclui uma chave |
+| `POST` | `/api/keys/:id/check` | Check ativo e individual |
+| `GET` | `/api/config` | Configuração atual |
+| `POST` | `/api/config` | Atualiza opções e limites |
 
-## Proxy (Porta 11431)
+## Respostas de proteção
 
-| Método | Endpoint | Descrição |
-|---|---|---|
-| `ALL` | `/v1/*` | Proxy reverso para `https://integrate.api.nvidia.com/v1/*` |
+Quando não há capacidade local, o proxy responde `429` com `Retry-After` e `error.type = "proxy_capacity_exhausted"`. Isso é intencional: rejeitar cedo protege as chaves contra uma fila sem limite e contra cascatas de fallback.
 
-## Configurações do Proxy
+Em erros de autenticação, rede, timeout, `429` ou `5xx`, outra chave elegível pode ser tentada. Erros de requisição como `400` ou `404` são devolvidos diretamente, pois repetir o mesmo payload em todas as chaves apenas multiplicaria a carga.
 
-| Configuração | Tipo | Padrão | Descrição |
-|---|---|---|---|
-| `disableAbort` | boolean | `false` | Quando `true`, não cancela requisições upstream ao desconectar o cliente |
-| `transparentMode` | boolean | `true` | Quando `true`, desabilita modificações de body e headers Fast-Track (ativo por padrão) |
+## Segurança operacional
 
-> **Nota**: Estas configurações são mantidas apenas em memória. O `transparentMode` reinicia sempre ativado (`true`); o `disableAbort` reinicia como `false`. O cooldown de 65s das chaves após 429 também é em memória e zera a cada reinício (esperado — o limite já terá resetado).
-
-## Estrutura do Projeto
-
-```
-├── server.js              # Aplicação principal (Express, servidor duplo)
-├── public/
-│   └── index.html          # Painel admin web (HTML + Tailwind CSS)
-├── Dockerfile              # Container Node.js 20 Alpine
-├── docker-compose.yml      # Orquestração Docker
-├── package.json            # Manifesto do projeto
-├── data/
-│   └── keys.json           # Armazenamento persistente das chaves (Docker volume)
-├── Plano.md                # Documentação de arquitetura
-└── example.md              # Exemplo de chamada direta à API NVIDIA NIM
-```
-
-## Dependências
-
-- **express** `^4.19.2` - Framework web (única dependência de runtime)
-- **Node.js 20+** - Requerido para `fetch` nativo, `AbortController` e Web Streams API
-- **Docker** + **Docker Compose** - Para deploy containerizado
-
-## Exemplo de Uso Direto
-
-```javascript
-import OpenAI from 'openai';
-
-const openai = new OpenAI({
-  apiKey: 'sua-chave-aqui',
-  baseURL: 'http://localhost:11431/v1',
-});
-
-const completion = await openai.chat.completions.create({
-  model: "z-ai/glm-5.1",
-  messages: [{ role: "user", content: "Hello!" }],
-  stream: true,
-});
-
-for await (const chunk of completion) {
-  process.stdout.write(chunk.choices[0]?.delta?.content || '');
-}
-```
-
-## Licença
-
-MIT
+- `data/keys.json` contém segredos: mantenha-o fora do Git e faça backup seguro.
+- Não publique a porta 88 na internet; o painel é administrativo e não possui login embutido.
+- Para acesso remoto, coloque autenticação e TLS em um reverse proxy.
+- Rode uma única instância por conjunto de chaves. Os limites são locais ao processo e não coordenam múltiplos containers.

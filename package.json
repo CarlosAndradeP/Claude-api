@@ -4,7 +4,8 @@
   "description": "Proxy local para balanceamento de chaves NVIDIA NIM",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test"
   },
   "dependencies": {
     "express": "^4.19.2"

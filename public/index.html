@@ -108,9 +108,29 @@
 
         <!-- Lista de chaves -->
 
+        <div class="bg-gray-800 p-6 rounded-lg shadow-lg mb-8 border border-gray-700">
+            <div class="flex flex-col md:flex-row md:items-end gap-4">
+                <div class="flex-1">
+                    <h2 class="text-xl font-semibold text-gray-200">Proteção anti-rajada</h2>
+                    <p class="text-sm text-gray-400 mt-1">Limites locais por chave. Os padrões deixam margem abaixo dos 40 RPM.</p>
+                </div>
+                <label class="text-xs text-gray-400">RPM/chave<input id="requestsPerMinute" type="number" min="1" class="block w-24 mt-1 bg-gray-700 border border-gray-600 rounded px-2 py-2 text-white"></label>
+                <label class="text-xs text-gray-400">Burst<input id="burst" type="number" min="1" class="block w-20 mt-1 bg-gray-700 border border-gray-600 rounded px-2 py-2 text-white"></label>
+                <label class="text-xs text-gray-400">Concorrência<input id="maxConcurrent" type="number" min="1" class="block w-24 mt-1 bg-gray-700 border border-gray-600 rounded px-2 py-2 text-white"></label>
+                <label class="text-xs text-gray-400">Tentativas<input id="maxAttempts" type="number" min="1" class="block w-24 mt-1 bg-gray-700 border border-gray-600 rounded px-2 py-2 text-white"></label>
+                <button id="saveLimits" class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded font-semibold">Salvar</button>
+            </div>
+        </div>
+
         <div class="bg-gray-800 p-6 rounded-lg shadow-lg border border-gray-700">
 
-            <h2 class="text-xl font-semibold mb-4 text-gray-200">Keys Ativas no Pool</h2>
+            <div class="flex items-center justify-between mb-4">
+                <div>
+                    <h2 class="text-xl font-semibold text-gray-200">Saúde e uso das chaves</h2>
+                    <p class="text-sm text-gray-400">Atualização automática a cada 10 segundos.</p>
+                </div>
+                <button id="refreshKeys" class="text-sm bg-gray-700 hover:bg-gray-600 px-3 py-2 rounded">Atualizar</button>
+            </div>
 
             <div class="overflow-x-auto">
 
@@ -125,8 +145,10 @@
                             <th class="p-3">Papel (Role)</th>
 
                             <th class="p-3">Key Parcial</th>
-
-                            <th class="p-3 rounded-tr-lg text-right">Ação</th>
+                            <th class="p-3">Saúde</th>
+                            <th class="p-3">Uso</th>
+                            <th class="p-3">Último sucesso</th>
+                            <th class="p-3 rounded-tr-lg text-right">Ações</th>
 
                         </tr>
 
@@ -168,7 +190,7 @@
 
             if(keys.length === 0) {
 
-                tbody.innerHTML = `<tr><td colspan="4" class="p-4 text-center text-gray-500">Nenhuma key cadastrada. O Proxy não irá funcionar.</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="7" class="p-4 text-center text-gray-500">Nenhuma key cadastrada. O Proxy não irá funcionar.</td></tr>`;
 
                 return;
 
@@ -192,21 +214,38 @@
 
 
 
-                const maskedKey = k.key.substring(0, 10) + '...' + k.key.substring(k.key.length - 4);
+                const healthStyles = {
+                    healthy: ['Saudável', 'bg-green-900 text-green-300'],
+                    unhealthy: ['Falhando', 'bg-red-900 text-red-300'],
+                    rate_limited: ['Cooldown', 'bg-yellow-900 text-yellow-300'],
+                    stale: ['Inativa', 'bg-orange-900 text-orange-300'],
+                    unknown: ['Não testada', 'bg-gray-600 text-gray-300']
+                };
+                const [healthLabel, healthClass] = healthStyles[k.health.status] || healthStyles.unknown;
+                const lastSuccess = k.stats.lastSuccessAt ? new Date(k.stats.lastSuccessAt).toLocaleString('pt-BR') : 'Nunca';
+                const successRate = k.stats.successRate === null ? '—' : `${k.stats.successRate}%`;
+                const safeName = escapeHtml(k.name);
+                const safeReason = escapeHtml(k.health.reason);
 
 
 
                 tr.innerHTML = `
 
-                    <td class="p-3 font-medium">${k.name}</td>
+                    <td class="p-3 font-medium">${safeName}</td>
 
                     <td class="p-3">${roleBadge}</td>
 
-                    <td class="p-3 font-mono text-sm text-gray-400">${maskedKey}</td>
+                    <td class="p-3 font-mono text-sm text-gray-400">${escapeHtml(k.maskedKey)}</td>
+                    <td class="p-3"><span title="${safeReason}" class="${healthClass} px-2 py-1 rounded text-xs font-bold">${healthLabel}</span><div class="text-xs text-gray-500 mt-1">${safeReason}</div></td>
+                    <td class="p-3 text-sm"><div>${k.stats.attempts} tentativas</div><div class="text-gray-400">${successRate} sucesso · ${k.stats.rateLimits} limites</div><div class="text-gray-500">${k.health.inFlight} em voo</div></td>
+                    <td class="p-3 text-sm text-gray-400">${lastSuccess}</td>
 
                     <td class="p-3 text-right">
 
-                        <button onclick="deleteKey('${k.id}')" class="text-red-400 hover:text-red-300 transition">
+                        <button data-check-id="${escapeHtml(k.id)}" title="Verificar agora" class="check-key text-blue-400 hover:text-blue-300 transition mr-3">
+                            <i class="fa-solid fa-heart-pulse"></i>
+                        </button>
+                        <button data-delete-id="${escapeHtml(k.id)}" title="Excluir" class="delete-key text-red-400 hover:text-red-300 transition">
 
                             <i class="fa-solid fa-trash"></i>
 
@@ -219,6 +258,9 @@
                 tbody.appendChild(tr);
 
             });
+
+            document.querySelectorAll('.check-key').forEach(button => button.addEventListener('click', () => checkKey(button.dataset.checkId, button)));
+            document.querySelectorAll('.delete-key').forEach(button => button.addEventListener('click', () => deleteKey(button.dataset.deleteId)));
 
         }
 
@@ -240,7 +282,7 @@
 
 
 
-            await fetch(API_URL, {
+            const response = await fetch(API_URL, {
 
                 method: 'POST',
 
@@ -252,6 +294,7 @@
 
 
 
+            if (!response.ok) return alert((await response.json()).error || 'Não foi possível salvar a chave.');
             document.getElementById('keyForm').reset();
 
             fetchKeys();
@@ -272,6 +315,26 @@
 
         }
 
+        async function checkKey(id, button) {
+            button.disabled = true;
+            button.classList.add('opacity-50');
+            try {
+                const response = await fetch(`${API_URL}/${id}/check`, { method: 'POST' });
+                if (!response.ok) {
+                    const result = await response.json();
+                    alert(result.error?.message || result.error || 'A chave falhou no check de saúde.');
+                }
+            } finally {
+                button.disabled = false;
+                button.classList.remove('opacity-50');
+                fetchKeys();
+            }
+        }
+
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
+        }
+
 
 
         // Init
@@ -287,6 +350,9 @@
             const conf = await res.json();
             toggleAbort.checked = conf.disableAbort;
             toggleTransparent.checked = conf.transparentMode;
+            for (const field of ['requestsPerMinute', 'burst', 'maxConcurrent', 'maxAttempts']) {
+                document.getElementById(field).value = conf[field];
+            }
         }
         
         toggleAbort.addEventListener('change', async (e) => {
@@ -307,6 +373,19 @@
                 alert("AVISO: O Modo Transparente desliga TODAS as modificações do Proxy, incluindo correção de Tokens e Fast-Track Headers. O OpenCode voltará a se comunicar com a NVIDIA exatamente como no original. Isso serve para testar de quem é o erro (NVIDIA ou Proxy).");
             }
         });
+
+        document.getElementById('saveLimits').addEventListener('click', async () => {
+            const payload = {};
+            for (const field of ['requestsPerMinute', 'burst', 'maxConcurrent', 'maxAttempts']) {
+                payload[field] = Number(document.getElementById(field).value);
+            }
+            const response = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            if (!response.ok) return alert((await response.json()).error || 'Configuração inválida.');
+            alert('Limites atualizados.');
+        });
+
+        document.getElementById('refreshKeys').addEventListener('click', fetchKeys);
+        setInterval(fetchKeys, 10000);
 
         fetchConfig();
 

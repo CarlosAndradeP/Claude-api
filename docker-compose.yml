@@ -6,9 +6,9 @@ services:
     container_name: nim_proxy_balancer
     ports:
       # Painel Admin
-      - "88:88"
+      - "127.0.0.1:88:88"
       # API Proxy
-      - "11431:11431"
+      - "127.0.0.1:11431:11431"
     volumes:
       # Cria um volume local ./data mapeado para /app/data
       # Isso garante que suas Keys não se percam caso o container reinicie

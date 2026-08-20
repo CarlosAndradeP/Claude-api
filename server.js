@@ -1,333 +1,374 @@
+'use strict';
+
 const express = require('express');
-const { Readable } = require('stream');
 const fs = require('fs');
 const path = require('path');
-
-const adminApp = express();
-const proxyApp = express();
+const { KeyPool, DEFAULT_LIMITS, normalizeKey } = require('./lib/key-pool');
 
 const DATA_DIR = path.join(__dirname, 'data');
 const KEYS_FILE = path.join(DATA_DIR, 'keys.json');
+const ADMIN_PORT = Number(process.env.ADMIN_PORT) || 88;
+const PROXY_PORT = Number(process.env.PROXY_PORT) || 11431;
+const UPSTREAM_ORIGIN = process.env.UPSTREAM_ORIGIN || 'https://integrate.api.nvidia.com';
+const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS) || 120_000;
+const PROXY_CORS_ORIGIN = process.env.PROXY_CORS_ORIGIN || '';
 
-// Garante que a pasta data existe (para o volume Docker)
-if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-}
+fs.mkdirSync(DATA_DIR, { recursive: true });
 
-let keys = [];
-
-// Carrega as chaves do disco
-if (fs.existsSync(KEYS_FILE)) {
+function loadKeys() {
+    if (!fs.existsSync(KEYS_FILE)) return [];
     try {
-        keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
-    } catch (e) {
-        console.error("Erro ao carregar chaves:", e);
+        const parsed = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
+        if (!Array.isArray(parsed)) return [];
+        const normalized = parsed.map(normalizeKey).filter(item => item.key);
+        return [...new Map(normalized.map(item => [item.key, item])).values()];
+    } catch (error) {
+        console.error('[Admin] Não foi possível carregar data/keys.json:', error.message);
+        return [];
     }
 }
 
-function saveKeys() {
-    fs.writeFileSync(KEYS_FILE, JSON.stringify(keys, null, 2));
+let keys = loadKeys();
+let saveTimer = null;
+
+function saveKeysNow() {
+    const tempFile = `${KEYS_FILE}.tmp`;
+    fs.writeFileSync(tempFile, JSON.stringify(keys, null, 2));
+    fs.renameSync(tempFile, KEYS_FILE);
 }
 
-// ==========================================
-// 1. SERVIDOR ADMIN (Porta 88)
-// ==========================================
-adminApp.use(express.json());
-adminApp.use(express.static(path.join(__dirname, 'public')));
-
-let proxyConfig = { disableAbort: false, transparentMode: true };
-
-adminApp.get('/api/config', (req, res) => res.json(proxyConfig));
-adminApp.post('/api/config', (req, res) => {
-    if (req.body.disableAbort !== undefined) proxyConfig.disableAbort = !!req.body.disableAbort;
-    if (req.body.transparentMode !== undefined) proxyConfig.transparentMode = !!req.body.transparentMode;
-    res.json(proxyConfig);
-});
-
-adminApp.get('/api/keys', (req, res) => res.json(keys));
-
-adminApp.post('/api/keys', (req, res) => {
-    const { key, role, name } = req.body;
-    const newKey = { id: Date.now().toString(), key, role, name };
-    keys.push(newKey);
-    saveKeys();
-    res.json(newKey);
-});
-
-adminApp.delete('/api/keys/:id', (req, res) => {
-    keys = keys.filter(k => k.id !== req.params.id);
-    saveKeys();
-    res.json({ success: true });
-});
-
-adminApp.listen(88, () => {
-    console.log('✅ Painel Administrativo rodando na porta 88');
-});
-
-
-// ==========================================
-// 2. SERVIDOR PROXY (Porta 11431)
-// ==========================================
-proxyApp.use((req, res, next) => {
-    // Configura o CORS básico pro proxy caso seja chamado por browser
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', '*');
-    if (req.method === 'OPTIONS') return res.sendStatus(200);
-    next();
-});
-proxyApp.use(express.raw({ type: '*/*', limit: '50mb' })); // Permite ler qualquer body (json, multipart, etc) como Buffer
-
-let subKeyIndex = 0;
-let allKeyIndex = 0;
-
-const COOLDOWN_MS = 65 * 1000;
-const keyCooldowns = new Map(); // keyId -> timestamp (ms) de liberação após HTTP 429
-
-function isKeyInCooldown(keyObj) {
-    const expiry = keyCooldowns.get(keyObj.id);
-    if (!expiry) return false;
-    if (Date.now() < expiry) return true;
-    keyCooldowns.delete(keyObj.id); // libera e evita crescimento indefinido do Map
-    return false;
+function scheduleSave() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+        try { saveKeysNow(); } catch (error) {
+            console.error('[Admin] Falha ao persistir estatísticas:', error.message);
+        }
+    }, 500);
+    saveTimer.unref?.();
 }
 
-proxyApp.all('/v1/*', async (req, res) => {
-    const agentType = (req.headers['x-agent-type'] || 'none').toLowerCase();
-    
-    console.log(`\n\n======================================================`);
-    console.log(`[Proxy 📥] NOVA REQUISIÇÃO RECEBIDA`);
-    console.log(`[Proxy ℹ️] Método: ${req.method} | Rota: ${req.url} | AgentType: ${agentType}`);
-    
-    // Mostra os headers omitindo autorização se houver
-    const safeHeaders = { ...req.headers };
-    delete safeHeaders['authorization'];
-    console.log(`[Proxy ℹ️] Headers:`, JSON.stringify(safeHeaders));
+const proxyConfig = {
+    disableAbort: false,
+    transparentMode: true,
+    requestsPerMinute: Number(process.env.REQUESTS_PER_MINUTE) || DEFAULT_LIMITS.requestsPerMinute,
+    burst: Number(process.env.KEY_BURST) || DEFAULT_LIMITS.burst,
+    maxConcurrent: Number(process.env.MAX_CONCURRENT_PER_KEY) || DEFAULT_LIMITS.maxConcurrent,
+    maxAttempts: Number(process.env.MAX_ATTEMPTS) || DEFAULT_LIMITS.maxAttempts
+};
+const pool = new KeyPool(keys, { ...proxyConfig, onChange: scheduleSave });
 
-    if (Buffer.isBuffer(req.body)) {
-        console.log(`[Proxy ℹ️] Tamanho do Body: ${req.body.length} bytes`);
-        if (req.body.length > 0) {
-            try {
-                console.log(`[Proxy ℹ️] Body Preview:`, req.body.toString('utf8').substring(0, 800));
-            } catch(e) {}
+function maskKey(key) {
+    if (!key) return '';
+    if (key.length <= 10) return `${key.slice(0, 2)}…${key.slice(-2)}`;
+    return `${key.slice(0, 7)}…${key.slice(-4)}`;
+}
+
+function publicKey(key) {
+    const attempts = key.stats.attempts || 0;
+    return {
+        id: key.id, name: key.name, role: key.role, maskedKey: maskKey(key.key), createdAt: key.createdAt,
+        stats: {
+            ...key.stats,
+            successRate: attempts ? Number(((key.stats.successes / attempts) * 100).toFixed(1)) : null,
+            averageLatencyMs: attempts ? Math.round(key.stats.totalLatencyMs / attempts) : null
+        },
+        health: pool.getHealth(key)
+    };
+}
+
+function parseRetryAfter(value) {
+    if (!value) return 0;
+    const seconds = Number(value);
+    if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+    const date = Date.parse(value);
+    return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
+}
+
+function upstreamHeaders(req, body) {
+    const headers = new Headers();
+    const ignored = new Set([
+        'authorization', 'host', 'content-length', 'connection', 'transfer-encoding', 'keep-alive',
+        'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'upgrade', 'x-agent-type'
+    ]);
+    for (const [name, value] of Object.entries(req.headers)) {
+        if (!ignored.has(name.toLowerCase()) && value !== undefined) {
+            headers.set(name, Array.isArray(value) ? value.join(', ') : value);
         }
     }
+    headers.set('accept-encoding', 'identity');
+    if (body?.length) headers.set('content-length', String(body.length));
+    return headers;
+}
 
-    // Categoriza chaves
-    const mainKeys = keys.filter(k => k.role === 'main' || k.role === 'all');
-    const subKeys = keys.filter(k => k.role === 'sub' || k.role === 'all');
-    const allKeys = keys;
+function prepareBody(req) {
+    if (req.method === 'GET' || req.method === 'HEAD' || !Buffer.isBuffer(req.body) || !req.body.length) return undefined;
+    if (proxyConfig.transparentMode) return req.body;
+    try {
+        const parsed = JSON.parse(req.body.toString('utf8'));
+        if (typeof parsed.model === 'string' && parsed.model.includes('glm-5.1')) {
+            if (parsed.max_tokens > 16_384) parsed.max_tokens = 16_384;
+            if (parsed.temperature === undefined) parsed.temperature = 1;
+            if (parsed.top_p === undefined) parsed.top_p = 1;
+        }
+        return Buffer.from(JSON.stringify(parsed));
+    } catch { return req.body; }
+}
 
-    if (allKeys.length === 0) {
-        console.error(`[Proxy 🛑] Erro: Nenhuma chave cadastrada!`);
-        return res.status(500).json({ error: "Nenhuma chave configurada no proxy. Acesse a porta 88 para adicionar." });
-    }
+function isRetryableStatus(status) {
+    return status === 401 || status === 403 || status === 408 || status === 429 || status >= 500;
+}
 
-    // Define a ordem de tentativa (Pipeline)
-    let pipeline = [];
-    if (agentType === 'main' && mainKeys.length > 0) {
-        pipeline = [...mainKeys, ...subKeys]; 
-    } else if (agentType === 'sub' && subKeys.length > 0) {
-        const startIdx = subKeyIndex % subKeys.length;
-        subKeyIndex++;
-        pipeline = [...subKeys.slice(startIdx), ...subKeys.slice(0, startIdx), ...mainKeys];
-    } else {
-        const startIdx = allKeyIndex % allKeys.length;
-        allKeyIndex++;
-        pipeline = [...allKeys.slice(startIdx), ...allKeys.slice(0, startIdx)];
-    }
+async function readErrorBody(response) {
+    return (await response.text()).slice(0, 4_000);
+}
 
-    pipeline = [...new Map(pipeline.map(item => [item.key, item])).values()];
-
-    const antesDoCooldown = pipeline.length;
-    pipeline = pipeline.filter(k => !isKeyInCooldown(k));
-    const puladas = antesDoCooldown - pipeline.length;
-    if (puladas > 0) {
-        console.log(`[Proxy ⏳] ${puladas} chave(s) em cooldown (429) puladas nesta requisição.`);
-    }
-
-    if (pipeline.length === 0) {
-        console.error(`[Proxy 🛑] Todas as chaves estão em cooldown (rate limit 429).`);
-        return res.status(429).json({ error: "Todas as chaves disponíveis estão em cooldown após rate limit (429). Aguarde alguns segundos e tente novamente." });
-    }
-
-    const targetUrl = `https://integrate.api.nvidia.com${req.url}`;
-
-    for (const keyObj of pipeline) {
-        const controller = new AbortController();
-        let clientClosed = false;
-        
-        const onClientDisconnect = () => {
-            console.warn(`[Proxy ⚠️] EVENTO: Cliente encerrou a conexão HTTP abruptamente (Aborted)!`);
-            clientClosed = true;
-            if (!proxyConfig.disableAbort) {
-                console.warn(`[Proxy ⚠️] Abortando requisição para NVIDIA...`);
-                controller.abort();
-            } else {
-                console.warn(`[Proxy ⚠️] Abort desativado nas configurações. A requisição vai continuar.`);
-            }
+function waitForDrainOrClose(response) {
+    return new Promise(resolve => {
+        const done = () => {
+            response.removeListener('drain', done);
+            response.removeListener('close', done);
+            resolve();
         };
-        req.on('aborted', onClientDisconnect);
+        response.once('drain', done);
+        response.once('close', done);
+    });
+}
+
+function sendUnavailable(res, retryAfterMs, message = 'Nenhuma chave possui capacidade disponível agora.') {
+    if (retryAfterMs) res.setHeader('Retry-After', String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
+    return res.status(429).json({ error: { message, type: 'proxy_capacity_exhausted', retry_after_ms: retryAfterMs || null } });
+}
+
+function createAdminApp() {
+    const app = express();
+    app.use(express.json({ limit: '32kb' }));
+    app.use(express.static(path.join(__dirname, 'public')));
+
+    app.get('/api/config', (_req, res) => res.json(proxyConfig));
+    app.post('/api/config', (req, res) => {
+        if (req.body.disableAbort !== undefined) proxyConfig.disableAbort = Boolean(req.body.disableAbort);
+        if (req.body.transparentMode !== undefined) proxyConfig.transparentMode = Boolean(req.body.transparentMode);
+        for (const field of ['requestsPerMinute', 'burst', 'maxConcurrent', 'maxAttempts']) {
+            if (req.body[field] !== undefined) {
+                const value = Math.floor(Number(req.body[field]));
+                const maximum = field === 'requestsPerMinute' ? 10_000 : 100;
+                if (!Number.isFinite(value) || value < 1 || value > maximum) {
+                    return res.status(400).json({ error: `${field} deve ser um inteiro entre 1 e ${maximum}` });
+                }
+                proxyConfig[field] = value;
+            }
+        }
+        pool.setLimits(proxyConfig);
+        return res.json(proxyConfig);
+    });
+
+    app.get('/api/keys', (_req, res) => res.json(keys.map(publicKey)));
+    app.post('/api/keys', (req, res) => {
+        const keyValue = typeof req.body.key === 'string' ? req.body.key.trim() : '';
+        const name = typeof req.body.name === 'string' ? req.body.name.trim() : '';
+        const role = req.body.role;
+        if (!keyValue || !name || !['main', 'sub', 'all'].includes(role)) {
+            return res.status(400).json({ error: 'Informe name, key e um role válido (main, sub ou all).' });
+        }
+        if (keys.some(item => item.key === keyValue)) return res.status(409).json({ error: 'Esta chave já está cadastrada.' });
+        const newKey = normalizeKey({ id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, key: keyValue, role, name });
+        keys.push(newKey);
+        pool.setKeys(keys);
+        saveKeysNow();
+        return res.status(201).json(publicKey(newKey));
+    });
+
+    app.delete('/api/keys/:id', (req, res) => {
+        const previousLength = keys.length;
+        keys = keys.filter(key => key.id !== req.params.id);
+        if (keys.length === previousLength) return res.status(404).json({ error: 'Chave não encontrada.' });
+        pool.setKeys(keys);
+        saveKeysNow();
+        return res.json({ success: true });
+    });
+
+    app.post('/api/keys/:id/check', async (req, res) => {
+        const key = keys.find(item => item.id === req.params.id);
+        if (!key) return res.status(404).json({ error: 'Chave não encontrada.' });
+        const excluded = new Set(keys.filter(item => item.id !== key.id).map(item => item.id));
+        const { reservation, retryAfterMs } = pool.acquire('none', excluded, 0, true);
+        if (!reservation) return sendUnavailable(res, retryAfterMs, 'Esta chave está ocupada ou em cooldown.');
+
+        const startedAt = Date.now();
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), Math.min(UPSTREAM_TIMEOUT_MS, 15_000));
+        try {
+            const response = await fetch(`${UPSTREAM_ORIGIN}/v1/models`, {
+                headers: { authorization: `Bearer ${key.key}`, 'accept-encoding': 'identity' }, signal: controller.signal
+            });
+            const errorText = response.ok ? '' : await readErrorBody(response);
+            reservation.finish({
+                status: response.status, success: response.ok, durationMs: Date.now() - startedAt,
+                retryAfterMs: parseRetryAfter(response.headers.get('retry-after')), error: errorText
+            });
+            return res.status(response.ok ? 200 : response.status).json(publicKey(key));
+        } catch (error) {
+            reservation.finish({ durationMs: Date.now() - startedAt, error: error.message });
+            return res.status(502).json({ error: error.name === 'AbortError' ? 'Check de saúde expirou.' : error.message, key: publicKey(key) });
+        } finally { clearTimeout(timeout); }
+    });
+
+    return app;
+}
+
+function createProxyApp() {
+    const app = express();
+    app.use((req, res, next) => {
+        if (PROXY_CORS_ORIGIN) {
+            res.setHeader('Access-Control-Allow-Origin', PROXY_CORS_ORIGIN);
+            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+            res.setHeader('Access-Control-Allow-Headers', '*');
+            res.setHeader('Vary', 'Origin');
+        }
+        if (req.method === 'OPTIONS') return res.sendStatus(204);
+        next();
+    });
+    app.use(express.raw({ type: '*/*', limit: '50mb' }));
+
+    app.all('/v1/*', async (req, res) => {
+        if (!keys.length) return res.status(503).json({ error: { message: 'Nenhuma chave configurada no proxy.' } });
+
+        const agentType = String(req.headers['x-agent-type'] || 'none').toLowerCase();
+        const body = prepareBody(req);
+        const excludedIds = new Set();
+        const targetUrl = `${UPSTREAM_ORIGIN}${req.originalUrl}`;
+        let currentController = null;
+        let clientClosed = false;
+        let lastError = null;
+        let shortestRetryAfter = null;
+
+        const onClientDisconnect = () => {
+            clientClosed = true;
+            if (!proxyConfig.disableAbort) currentController?.abort();
+        };
+        const onResponseClose = () => {
+            if (!res.writableEnded) onClientDisconnect();
+        };
+        req.once('aborted', onClientDisconnect);
+        res.once('close', onResponseClose);
 
         try {
-            const fetchOptions = {
-                method: req.method,
-                headers: {
-                    'Authorization': `Bearer ${keyObj.key}`,
-                    'Content-Type': req.headers['content-type'] || 'application/json',
-                    'Accept': req.headers['accept'] || '*/*',
-                    'Accept-Encoding': 'identity'
+            for (let attempt = 1; attempt <= Math.min(proxyConfig.maxAttempts, keys.length); attempt += 1) {
+                const acquired = pool.acquire(agentType, excludedIds, body?.length || 0);
+                if (!acquired.reservation) {
+                    shortestRetryAfter = acquired.retryAfterMs;
+                    break;
                 }
-            };
 
-            if (req.method !== 'GET' && req.method !== 'HEAD' && req.body) {
-                if (proxyConfig.transparentMode) {
-                    // TRANSPARENT MODE: No JSON parsing, no modifications, no Fast-Track.
-                    // Just raw pass-through of the exact bytes received.
-                    fetchOptions.body = req.body;
-                    if (Buffer.isBuffer(req.body)) {
-                        fetchOptions.headers['Content-Length'] = req.body.length.toString();
-                    }
-                    console.log(`[Proxy 🔍] Modo Transparente Ativo: Payload repassado sem modificações.`);
-                } else {
-                    let finalBodyStr = "";
-                    let finalBodyBuffer = null;
-                    
-                    // Intercepta e corrige os parâmetros para o modelo glm-5.1
-                    if (Buffer.isBuffer(req.body) && req.body.length > 0) {
-                        try {
-                            const jsonBody = JSON.parse(req.body.toString('utf8'));
-                            
-                            // Força os limites e parâmetros exigidos pela documentação da NVIDIA NIM
-                            if (jsonBody.model && jsonBody.model.includes('glm-5.1')) {
-                                if (jsonBody.max_tokens > 16384) {
-                                    jsonBody.max_tokens = 16384;
-                                }
-                                // Adiciona os parâmetros recomendados se não existirem
-                                if (jsonBody.temperature === undefined) jsonBody.temperature = 1;
-                                if (jsonBody.top_p === undefined) jsonBody.top_p = 1;
-                            }
-                            finalBodyStr = JSON.stringify(jsonBody);
-                        } catch (e) {
-                            finalBodyStr = req.body.toString('utf8');
-                        }
-                    } else if (!Buffer.isBuffer(req.body) && Object.keys(req.body).length > 0) {
-                        finalBodyStr = JSON.stringify(req.body);
-                    }
-                    
-                    if (finalBodyStr) {
-                        finalBodyBuffer = Buffer.from(finalBodyStr, 'utf8');
-                        fetchOptions.body = finalBodyBuffer;
-                        fetchOptions.headers['Content-Length'] = finalBodyBuffer.length.toString();
-                        
-                        // FAST-TRACK: Prevents OpenCode from timing out waiting for NVIDIA
-                        if (finalBodyStr.includes('"stream":true') || finalBodyStr.includes('"stream": true')) {
-                            if (!res.headersSent) {
-                                res.writeHead(200, {
-                                    'Content-Type': 'text/event-stream; charset=utf-8',
-                                    'Cache-Control': 'no-cache',
-                                    'Connection': 'keep-alive',
-                                    'Transfer-Encoding': 'chunked',
-                                    'X-Accel-Buffering': 'no',
-                                    'Access-Control-Allow-Origin': '*',
-                                    'Access-Control-Allow-Headers': '*'
-                                });
-                                res.write(':\\n\\n'); // Envia um heartbeat vazio em formato SSE para iniciar o stream sem quebrar o cliente
-                                console.log(`[Proxy ⚡] Fast-Track: Headers 200 OK enviados imediatamente para evitar timeout do OpenCode!`);
+                const { reservation } = acquired;
+                const key = reservation.key;
+                excludedIds.add(key.id);
+                currentController = new AbortController();
+                const timeout = setTimeout(() => currentController.abort(), UPSTREAM_TIMEOUT_MS);
+                const startedAt = Date.now();
+                let finished = false;
+                const finish = result => {
+                    if (finished) return;
+                    finished = true;
+                    reservation.finish({ ...result, durationMs: Date.now() - startedAt });
+                };
+
+                try {
+                    const headers = upstreamHeaders(req, body);
+                    headers.set('authorization', `Bearer ${key.key}`);
+                    console.log(`[Proxy] ${req.method} ${req.originalUrl} tentativa ${attempt} com ${key.name} (${maskKey(key.key)})`);
+                    const upstream = await fetch(targetUrl, { method: req.method, headers, body, signal: currentController.signal });
+                    clearTimeout(timeout);
+
+                    // Se o cliente sumiu mas pediu para não abortar, conclui apenas esta chamada
+                    // e descarta o body. Não faz fallback inútil nem tenta escrever em um socket fechado.
+                    if (clientClosed && proxyConfig.disableAbort) {
+                        let bytesOut = 0;
+                        if (upstream.body) {
+                            const reader = upstream.body.getReader();
+                            while (true) {
+                                const { done, value } = await reader.read();
+                                if (done) break;
+                                bytesOut += value.byteLength;
                             }
                         }
+                        finish({
+                            status: upstream.status,
+                            success: upstream.ok,
+                            bytesOut,
+                            retryAfterMs: parseRetryAfter(upstream.headers.get('retry-after')),
+                            error: upstream.ok ? '' : `HTTP ${upstream.status}`
+                        });
+                        return;
                     }
-                }
-            }
 
-            console.log(`[Proxy 🚀] Enviando fetch para: ${targetUrl} | Usando chave: ...${keyObj.key.slice(-4)}`);
-            var startTime = Date.now(); // Declarado com var para ser acessível no catch
-            
-            fetchOptions.signal = controller.signal;
-            const fetchRes = await fetch(targetUrl, fetchOptions);
-            const duration = Date.now() - startTime;
-            
-            req.removeListener('aborted', onClientDisconnect);
-
-            console.log(`[Proxy ✅] Resposta da NVIDIA recebida em ${duration}ms! Status: ${fetchRes.status}`);
-
-            if (fetchRes.status === 429) {
-                keyCooldowns.set(keyObj.id, Date.now() + COOLDOWN_MS);
-                console.warn(`[Proxy ⚠️] Rate limit (429) na chave '${keyObj.name}'. Colocada em cooldown por ${COOLDOWN_MS / 1000}s. Realizando fallback para a próxima chave...`);
-                continue;
-            }
-
-            if (fetchRes.status !== 200) {
-                console.error(`[Proxy ❌] Erro da NVIDIA (HTTP ${fetchRes.status}) com a chave '${keyObj.name}'`);
-                const errorText = await fetchRes.text();
-                console.error(`[Proxy ❌] Detalhes do Erro:`, errorText);
-                
-                if (res.headersSent) {
-                    // Já iniciamos o Fast-Track SSE. Temos que mandar o erro como se fosse uma resposta do modelo,
-                    // ou no formato de erro da OpenAI para que o OpenCode exiba na tela e não pare "do nada".
-                    res.write(`data: {"error": {"message": ${JSON.stringify(errorText)}}}\n\n`);
-                    res.end();
-                } else {
-                    res.status(fetchRes.status).send(errorText);
-                }
-                return;
-            }
-
-            const excludeHeaders = ['content-encoding', 'content-length', 'transfer-encoding', 'connection'];
-            fetchRes.headers.forEach((val, key) => {
-                if (!excludeHeaders.includes(key.toLowerCase())) {
-                    if (!res.headersSent) {
-                        res.setHeader(key, val);
+                    if (isRetryableStatus(upstream.status)) {
+                        const errorText = await readErrorBody(upstream);
+                        const retryAfterMs = parseRetryAfter(upstream.headers.get('retry-after'));
+                        if (retryAfterMs > 0) {
+                            shortestRetryAfter = shortestRetryAfter === null
+                                ? retryAfterMs
+                                : Math.min(shortestRetryAfter, retryAfterMs);
+                        }
+                        finish({ status: upstream.status, retryAfterMs, error: errorText });
+                        lastError = { status: upstream.status, message: errorText || `HTTP ${upstream.status}` };
+                        console.warn(`[Proxy] ${key.name} respondeu ${upstream.status}; chave isolada e próxima tentativa será selecionada.`);
+                        continue;
                     }
-                }
-            });
 
-            if (!res.headersSent) {
-                res.status(fetchRes.status);
-            }
+                    const excludedHeaders = new Set(['content-encoding', 'content-length', 'transfer-encoding', 'connection']);
+                    upstream.headers.forEach((value, name) => {
+                        if (!excludedHeaders.has(name.toLowerCase())) res.setHeader(name, value);
+                    });
+                    res.status(upstream.status);
+                    if (!upstream.body) {
+                        finish({ status: upstream.status, success: upstream.status < 500 });
+                        return res.end();
+                    }
 
-            if (fetchRes.body) {
-                console.log(`[Proxy 🌊] Iniciando streaming de altíssima eficiência (Zero-Buffer) para o cliente...`);
-                const reader = fetchRes.body.getReader();
-                
-                const pump = async () => {
+                    let bytesOut = 0;
+                    const reader = upstream.body.getReader();
                     try {
                         while (true) {
                             const { done, value } = await reader.read();
                             if (done) break;
-                            res.write(value);
+                            bytesOut += value.byteLength;
+                            if (!clientClosed && !res.write(value)) await waitForDrainOrClose(res);
                         }
-                        console.log(`[Proxy ✨] Streaming finalizado com sucesso!`);
-                    } catch (err) {
-                        console.error(`[Proxy ❌] Erro no stream com a chave '${keyObj.name}':`, err.message);
-                        if (!res.headersSent) res.status(500);
-                    } finally {
-                        res.end();
+                        finish({ status: upstream.status, success: upstream.status < 500, bytesOut });
+                        return res.end();
+                    } catch (error) {
+                        finish({ status: 502, bytesOut, error: `Stream interrompido: ${error.message}` });
+                        if (!res.headersSent) res.status(502);
+                        return res.end();
                     }
-                };
-                pump();
-                return;
-            } else {
-                console.log(`[Proxy ✨] Resposta sem body. Finalizando req.`);
-                return res.end();
+                } catch (error) {
+                    clearTimeout(timeout);
+                    finish({ error: error.name === 'AbortError' ? 'Timeout ou cancelamento' : error.message });
+                    if (clientClosed) return;
+                    lastError = { status: 502, message: error.name === 'AbortError' ? 'Timeout no upstream' : error.message };
+                    console.warn(`[Proxy] Falha de rede em ${key.name}: ${lastError.message}`);
+                }
             }
-
-        } catch (error) {
+        } finally {
             req.removeListener('aborted', onClientDisconnect);
-            const duration = typeof startTime !== 'undefined' ? Date.now() - startTime : 0;
-            if (error.name === 'AbortError' || clientClosed) {
-                console.warn(`[Proxy ⚠️] Fetch cancelado (AbortError). O cliente (OpenCode) desconectou após ${duration}ms aguardando. Erro: ${error.message}`);
-                return; // Já respondemos ou o cliente abortou
-            }
-            console.error(`[Proxy ❌] Erro ao conectar na API da NVIDIA após ${duration}ms com a chave '${keyObj.name}':`, error.message);
-            continue; 
+            res.removeListener('close', onResponseClose);
         }
-    }
 
-    console.error(`[Proxy 🛑] Todas as chaves do pool falharam.`);
-    res.status(429).json({ error: "Rate limit atingido em todas as chaves da Nvidia NIM disponíveis." });
-});
+        if (clientClosed || res.headersSent) return;
+        if (lastError && lastError.status !== 429) {
+            return res.status(502).json({ error: { message: 'As tentativas no upstream falharam.', last_error: lastError } });
+        }
+        return sendUnavailable(res, shortestRetryAfter, 'Todas as chaves elegíveis estão limitadas, ocupadas ou em recuperação.');
+    });
+    return app;
+}
 
-proxyApp.listen(11431, () => {
-    console.log('✅ Proxy NVIDIA NIM rodando na porta 11431');
-});
+function start() {
+    const adminServer = createAdminApp().listen(ADMIN_PORT, () => console.log(`[Admin] Painel em http://localhost:${ADMIN_PORT}`));
+    const proxyServer = createProxyApp().listen(PROXY_PORT, () => console.log(`[Proxy] API em http://localhost:${PROXY_PORT}`));
+    return { adminServer, proxyServer };
+}
+
+if (require.main === module) start();
+module.exports = { createAdminApp, createProxyApp, start, parseRetryAfter, prepareBody, publicKey, pool };
