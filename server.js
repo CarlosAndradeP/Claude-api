@@ -4,13 +4,15 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const { KeyPool, DEFAULT_LIMITS, normalizeKey } = require('./lib/key-pool');
+const { waitForDrainOrClose } = require('./lib/stream-flow');
 
-const DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const KEYS_FILE = path.join(DATA_DIR, 'keys.json');
 const ADMIN_PORT = Number(process.env.ADMIN_PORT) || 88;
 const PROXY_PORT = Number(process.env.PROXY_PORT) || 11431;
 const UPSTREAM_ORIGIN = process.env.UPSTREAM_ORIGIN || 'https://integrate.api.nvidia.com';
 const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS) || 120_000;
+const UPSTREAM_IDLE_TIMEOUT_MS = Number(process.env.UPSTREAM_IDLE_TIMEOUT_MS) || UPSTREAM_TIMEOUT_MS;
 const PROXY_CORS_ORIGIN = process.env.PROXY_CORS_ORIGIN || '';
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -122,18 +124,6 @@ async function readErrorBody(response) {
     return (await response.text()).slice(0, 4_000);
 }
 
-function waitForDrainOrClose(response) {
-    return new Promise(resolve => {
-        const done = () => {
-            response.removeListener('drain', done);
-            response.removeListener('close', done);
-            resolve();
-        };
-        response.once('drain', done);
-        response.once('close', done);
-    });
-}
-
 function sendUnavailable(res, retryAfterMs, message = 'Nenhuma chave possui capacidade disponível agora.') {
     if (retryAfterMs) res.setHeader('Retry-After', String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
     return res.status(429).json({ error: { message, type: 'proxy_capacity_exhausted', retry_after_ms: retryAfterMs || null } });
@@ -146,18 +136,24 @@ function createAdminApp() {
 
     app.get('/api/config', (_req, res) => res.json(proxyConfig));
     app.post('/api/config', (req, res) => {
-        if (req.body.disableAbort !== undefined) proxyConfig.disableAbort = Boolean(req.body.disableAbort);
-        if (req.body.transparentMode !== undefined) proxyConfig.transparentMode = Boolean(req.body.transparentMode);
-        for (const field of ['requestsPerMinute', 'burst', 'maxConcurrent', 'maxAttempts']) {
+        const nextConfig = { ...proxyConfig };
+        for (const field of ['disableAbort', 'transparentMode']) {
             if (req.body[field] !== undefined) {
-                const value = Math.floor(Number(req.body[field]));
-                const maximum = field === 'requestsPerMinute' ? 10_000 : 100;
-                if (!Number.isFinite(value) || value < 1 || value > maximum) {
-                    return res.status(400).json({ error: `${field} deve ser um inteiro entre 1 e ${maximum}` });
-                }
-                proxyConfig[field] = value;
+                if (typeof req.body[field] !== 'boolean') return res.status(400).json({ error: `${field} deve ser booleano` });
+                nextConfig[field] = req.body[field];
             }
         }
+        for (const field of ['requestsPerMinute', 'burst', 'maxConcurrent', 'maxAttempts']) {
+            if (req.body[field] !== undefined) {
+                const value = req.body[field];
+                const maximum = field === 'requestsPerMinute' ? 10_000 : 100;
+                if (!Number.isInteger(value) || value < 1 || value > maximum) {
+                    return res.status(400).json({ error: `${field} deve ser um inteiro entre 1 e ${maximum}` });
+                }
+                nextConfig[field] = value;
+            }
+        }
+        Object.assign(proxyConfig, nextConfig);
         pool.setLimits(proxyConfig);
         return res.json(proxyConfig);
     });
@@ -202,6 +198,7 @@ function createAdminApp() {
                 headers: { authorization: `Bearer ${key.key}`, 'accept-encoding': 'identity' }, signal: controller.signal
             });
             const errorText = response.ok ? '' : await readErrorBody(response);
+            if (response.ok) await response.body?.cancel();
             reservation.finish({
                 status: response.status, success: response.ok, durationMs: Date.now() - startedAt,
                 retryAfterMs: parseRetryAfter(response.headers.get('retry-after')), error: errorText
@@ -254,6 +251,7 @@ function createProxyApp() {
 
         try {
             for (let attempt = 1; attempt <= Math.min(proxyConfig.maxAttempts, keys.length); attempt += 1) {
+                if (clientClosed) return;
                 const acquired = pool.acquire(agentType, excludedIds, body?.length || 0);
                 if (!acquired.reservation) {
                     shortestRetryAfter = acquired.retryAfterMs;
@@ -264,7 +262,12 @@ function createProxyApp() {
                 const key = reservation.key;
                 excludedIds.add(key.id);
                 currentController = new AbortController();
-                const timeout = setTimeout(() => currentController.abort(), UPSTREAM_TIMEOUT_MS);
+                const controller = currentController;
+                let timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+                const resetIdleTimeout = () => {
+                    clearTimeout(timeout);
+                    timeout = setTimeout(() => controller.abort(), UPSTREAM_IDLE_TIMEOUT_MS);
+                };
                 const startedAt = Date.now();
                 let finished = false;
                 const finish = result => {
@@ -278,7 +281,7 @@ function createProxyApp() {
                     headers.set('authorization', `Bearer ${key.key}`);
                     console.log(`[Proxy] ${req.method} ${req.originalUrl} tentativa ${attempt} com ${key.name} (${maskKey(key.key)})`);
                     const upstream = await fetch(targetUrl, { method: req.method, headers, body, signal: currentController.signal });
-                    clearTimeout(timeout);
+                    resetIdleTimeout();
 
                     // Se o cliente sumiu mas pediu para não abortar, conclui apenas esta chamada
                     // e descarta o body. Não faz fallback inútil nem tenta escrever em um socket fechado.
@@ -289,6 +292,7 @@ function createProxyApp() {
                             while (true) {
                                 const { done, value } = await reader.read();
                                 if (done) break;
+                                resetIdleTimeout();
                                 bytesOut += value.byteLength;
                             }
                         }
@@ -332,22 +336,27 @@ function createProxyApp() {
                         while (true) {
                             const { done, value } = await reader.read();
                             if (done) break;
+                            resetIdleTimeout();
                             bytesOut += value.byteLength;
-                            if (!clientClosed && !res.write(value)) await waitForDrainOrClose(res);
+                            if (!clientClosed && !res.write(value)) await waitForDrainOrClose(res, controller.signal);
                         }
                         finish({ status: upstream.status, success: upstream.status < 500, bytesOut });
                         return res.end();
                     } catch (error) {
-                        finish({ status: 502, bytesOut, error: `Stream interrompido: ${error.message}` });
-                        if (!res.headersSent) res.status(502);
-                        return res.end();
+                        finish({ status: 502, cancelled: clientClosed, bytesOut, error: `Stream interrompido: ${error.message}` });
+                        // A normal EOF would make truncated SSE/JSON look successful.
+                        if (res.headersSent) return res.destroy();
+                        if (clientClosed) return;
+                        return res.status(502).json({ error: { message: 'Stream interrompido no upstream.' } });
                     }
                 } catch (error) {
                     clearTimeout(timeout);
-                    finish({ error: error.name === 'AbortError' ? 'Timeout ou cancelamento' : error.message });
+                    finish({ cancelled: clientClosed, error: error.name === 'AbortError' ? 'Timeout ou cancelamento' : error.message });
                     if (clientClosed) return;
                     lastError = { status: 502, message: error.name === 'AbortError' ? 'Timeout no upstream' : error.message };
                     console.warn(`[Proxy] Falha de rede em ${key.name}: ${lastError.message}`);
+                } finally {
+                    clearTimeout(timeout);
                 }
             }
         } finally {
@@ -358,6 +367,13 @@ function createProxyApp() {
         if (clientClosed || res.headersSent) return;
         if (lastError && lastError.status !== 429) {
             return res.status(502).json({ error: { message: 'As tentativas no upstream falharam.', last_error: lastError } });
+        }
+        // Recompute from the whole pool: excluded keys may now be cooling down,
+        // and local backoff can be longer than the upstream's Retry-After.
+        const now = Date.now();
+        const availability = keys.map(key => pool.availability(key, now));
+        if (availability.length && availability.every(item => !item.available)) {
+            shortestRetryAfter = Math.max(1, Math.min(...availability.map(item => item.retryAt)) - now);
         }
         return sendUnavailable(res, shortestRetryAfter, 'Todas as chaves elegíveis estão limitadas, ocupadas ou em recuperação.');
     });

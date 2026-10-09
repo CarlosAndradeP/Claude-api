@@ -78,3 +78,29 @@ test('prioriza o papel do agente sem perder fallback', () => {
     const fallback = pool.acquire('sub', new Set(['sub'])).reservation;
     assert.equal(fallback.key.id, 'main');
 });
+
+test('Retry-After maior que o teto local continua sendo respeitado', () => {
+    const now = 1_000;
+    const pool = new KeyPool([key('a')], { now: () => now, baseCooldownMs: 100, maxCooldownMs: 1_000 });
+    pool.acquire().reservation.finish({ status: 429, retryAfterMs: 5_000 });
+    assert.equal(pool.acquire().retryAfterMs, 5_000);
+});
+
+test('cancelamento libera a reserva sem isolar uma chave saudável', () => {
+    const item = key('a');
+    const pool = new KeyPool([item]);
+    pool.acquire().reservation.finish({ status: 200, success: true });
+    pool.acquire().reservation.finish({ status: 502, cancelled: true });
+    assert.equal(pool.getHealth(item).status, 'healthy');
+    assert.equal(pool.getHealth(item).inFlight, 0);
+    assert.equal(item.stats.failures, 0);
+    assert.equal(item.stats.cancellations, 1);
+});
+
+test('falha explícita não é convertida em sucesso pelo status HTTP', () => {
+    const item = key('a');
+    const pool = new KeyPool([item]);
+    pool.acquire().reservation.finish({ status: 200, success: false, error: 'incomplete body' });
+    assert.equal(item.stats.successes, 0);
+    assert.equal(item.stats.failures, 1);
+});

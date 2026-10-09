@@ -72,6 +72,8 @@ Os limites podem ser alterados no painel. Variáveis de ambiente definem os valo
 | `MAX_CONCURRENT_PER_KEY` | `2` | Chamadas simultâneas por chave |
 | `MAX_ATTEMPTS` | `3` | Máximo de chaves tentadas por requisição |
 | `UPSTREAM_TIMEOUT_MS` | `120000` | Timeout até o upstream responder com headers |
+| `UPSTREAM_IDLE_TIMEOUT_MS` | igual ao timeout de headers | Timeout sem novos chunks após os headers; reinicia a cada chunk |
+| `DATA_DIR` | `./data` | Diretório de chaves e estatísticas |
 | `UPSTREAM_ORIGIN` | NVIDIA NIM | Origem alternativa, útil para testes |
 | `ADMIN_PORT` | `88` | Porta do painel |
 | `PROXY_PORT` | `11431` | Porta do proxy |
@@ -102,6 +104,18 @@ O antigo “Fast-Track” foi removido. Enviar `200 OK` antes da resposta do ups
 Quando não há capacidade local, o proxy responde `429` com `Retry-After` e `error.type = "proxy_capacity_exhausted"`. Isso é intencional: rejeitar cedo protege as chaves contra uma fila sem limite e contra cascatas de fallback.
 
 Em erros de autenticação, rede, timeout, `429` ou `5xx`, outra chave elegível pode ser tentada. Erros de requisição como `400` ou `404` são devolvidos diretamente, pois repetir o mesmo payload em todas as chaves apenas multiplicaria a carga.
+
+Streams interrompidos encerram a conexão com erro, preservando a indicação de resposta incompleta no cliente. Cancelamentos do cliente liberam a capacidade sem penalizar a saúde da chave. O `Retry-After` de esgotamento reflete o cooldown real do pool.
+
+## Verificação com o Web Agent
+
+Na pasta `web-agent`, com as dependências dos dois projetos instaladas:
+
+```bash
+node --import tsx scripts/verify-proxy-integration.ts ../Claude-api
+```
+
+O script valida streaming, chamada de ferramenta, devolução do resultado ao modelo e propagação de interrupções usando o SDK do Web Agent e este proxy. Usa chaves fictícias, dados temporários e upstream local, sem consumir cota da NVIDIA.
 
 ## Segurança operacional
 
