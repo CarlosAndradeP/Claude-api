@@ -109,7 +109,7 @@
         <!-- Lista de chaves -->
 
         <div class="bg-gray-800 p-6 rounded-lg shadow-lg mb-8 border border-gray-700">
-            <div class="flex flex-col md:flex-row md:items-end gap-4">
+            <div class="flex flex-wrap items-end gap-4">
                 <div class="flex-1">
                     <h2 class="text-xl font-semibold text-gray-200">Proteção anti-rajada</h2>
                     <p class="text-sm text-gray-400 mt-1">Limites locais por chave. Os padrões deixam margem abaixo dos 40 RPM.</p>
@@ -118,6 +118,9 @@
                 <label class="text-xs text-gray-400">Burst<input id="burst" type="number" min="1" class="block w-20 mt-1 bg-gray-700 border border-gray-600 rounded px-2 py-2 text-white"></label>
                 <label class="text-xs text-gray-400">Concorrência<input id="maxConcurrent" type="number" min="1" class="block w-24 mt-1 bg-gray-700 border border-gray-600 rounded px-2 py-2 text-white"></label>
                 <label class="text-xs text-gray-400">Tentativas<input id="maxAttempts" type="number" min="1" class="block w-24 mt-1 bg-gray-700 border border-gray-600 rounded px-2 py-2 text-white"></label>
+                <label class="text-xs text-gray-400">Espera na fila (ms)<input id="queueWaitMs" type="number" min="0" max="10000" class="block w-28 mt-1 bg-gray-700 border border-gray-600 rounded px-2 py-2 text-white"></label>
+                <label class="text-xs text-gray-400">Máximo na fila<input id="maxQueueLength" type="number" min="0" max="1000" class="block w-28 mt-1 bg-gray-700 border border-gray-600 rounded px-2 py-2 text-white"></label>
+                <label class="text-xs text-gray-400">Modelo para verificar chaves<input id="healthCheckModel" type="text" maxlength="256" class="block w-64 mt-1 bg-gray-700 border border-gray-600 rounded px-2 py-2 text-white"></label>
                 <button id="saveLimits" class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded font-semibold">Salvar</button>
             </div>
         </div>
@@ -127,7 +130,7 @@
             <div class="flex items-center justify-between mb-4">
                 <div>
                     <h2 class="text-xl font-semibold text-gray-200">Saúde e uso das chaves</h2>
-                    <p class="text-sm text-gray-400">Atualização automática a cada 10 segundos.</p>
+                    <p class="text-sm text-gray-400">Atualização automática a cada 10 segundos. O botão de saúde faz uma inferência autenticada mínima e consome cota da API.</p>
                 </div>
                 <button id="refreshKeys" class="text-sm bg-gray-700 hover:bg-gray-600 px-3 py-2 rounded">Atualizar</button>
             </div>
@@ -222,10 +225,10 @@
                     unknown: ['Não testada', 'bg-gray-600 text-gray-300']
                 };
                 const [healthLabel, healthClass] = healthStyles[k.health.status] || healthStyles.unknown;
-                const lastSuccess = k.stats.lastSuccessAt ? new Date(k.stats.lastSuccessAt).toLocaleString('pt-BR') : 'Nunca';
+                const lastSuccess = k.health.authVerifiedAt ? new Date(k.health.authVerifiedAt).toLocaleString('pt-BR') : 'Não verificada';
                 const successRate = k.stats.successRate === null ? '—' : `${k.stats.successRate}%`;
                 const safeName = escapeHtml(k.name);
-                const safeReason = escapeHtml(k.health.reason);
+                const safeReason = escapeHtml(k.health.reason + (k.health.restrictedModels?.length ? ` · ${k.health.restrictedModels.length} modelo(s) com restrição temporária` : ''));
 
 
 
@@ -242,7 +245,7 @@
 
                     <td class="p-3 text-right">
 
-                        <button data-check-id="${escapeHtml(k.id)}" title="Verificar agora" class="check-key text-blue-400 hover:text-blue-300 transition mr-3">
+                        <button data-check-id="${escapeHtml(k.id)}" title="Verificar com inferência autenticada mínima" class="check-key text-blue-400 hover:text-blue-300 transition mr-3">
                             <i class="fa-solid fa-heart-pulse"></i>
                         </button>
                         <button data-delete-id="${escapeHtml(k.id)}" title="Excluir" class="delete-key text-red-400 hover:text-red-300 transition">
@@ -350,38 +353,38 @@
             const conf = await res.json();
             toggleAbort.checked = conf.disableAbort;
             toggleTransparent.checked = conf.transparentMode;
-            for (const field of ['requestsPerMinute', 'burst', 'maxConcurrent', 'maxAttempts']) {
+            for (const field of ['requestsPerMinute', 'burst', 'maxConcurrent', 'maxAttempts', 'queueWaitMs', 'maxQueueLength', 'healthCheckModel']) {
                 document.getElementById(field).value = conf[field];
             }
         }
         
         toggleAbort.addEventListener('change', async (e) => {
-            await fetch('/api/config', {
+            const response = await fetch('/api/config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ disableAbort: e.target.checked })
             });
+            if (!response.ok) { alert((await response.json()).error || 'Falha ao salvar.'); await fetchConfig(); }
         });
 
         toggleTransparent.addEventListener('change', async (e) => {
-            await fetch('/api/config', {
+            const response = await fetch('/api/config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ transparentMode: e.target.checked })
             });
-            if (e.target.checked) {
-                alert("AVISO: O Modo Transparente desliga TODAS as modificações do Proxy, incluindo correção de Tokens e Fast-Track Headers. O OpenCode voltará a se comunicar com a NVIDIA exatamente como no original. Isso serve para testar de quem é o erro (NVIDIA ou Proxy).");
-            }
+            if (!response.ok) { alert((await response.json()).error || 'Falha ao salvar.'); await fetchConfig(); }
         });
 
         document.getElementById('saveLimits').addEventListener('click', async () => {
             const payload = {};
-            for (const field of ['requestsPerMinute', 'burst', 'maxConcurrent', 'maxAttempts']) {
+            for (const field of ['requestsPerMinute', 'burst', 'maxConcurrent', 'maxAttempts', 'queueWaitMs', 'maxQueueLength']) {
                 payload[field] = Number(document.getElementById(field).value);
             }
+            payload.healthCheckModel = document.getElementById('healthCheckModel').value.trim();
             const response = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
             if (!response.ok) return alert((await response.json()).error || 'Configuração inválida.');
-            alert('Limites atualizados.');
+            alert('Configuração salva e preservada após reinício.');
         });
 
         document.getElementById('refreshKeys').addEventListener('click', fetchKeys);
